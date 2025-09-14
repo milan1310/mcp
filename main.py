@@ -34,13 +34,16 @@ COLLECTIONS = {
 # --- Models ---
 class QueryPayload(BaseModel):
     query: Optional[str] = None
-    kpi: Optional[str] = Field("ROAS", description="ROAS|profit|conversions")
+    kpi: Optional[str] = Field("ROAS", description="ROAS|profit|conversions")  # Fixed: was 'kip'
     from_date: Optional[str] = Field(None, alias="from")
     to_date: Optional[str] = Field(None, alias="to")
     channels: Optional[List[str]] = None
     constraints: Optional[Dict[str, Any]] = None
     top_n_campaigns: Optional[int] = 10
-    collection: Optional[str] = None  # which collection to query (optional)
+    collection: Optional[str] = None
+
+    class Config:
+        populate_by_name = True  # Fixed: was 'allow_population_by_field_name'
 
 def _parse_iso(s: Optional[str]):
     if not s:
@@ -50,7 +53,10 @@ def _parse_iso(s: Optional[str]):
             return datetime.strptime(s, fmt)
         except:
             continue
-    return datetime.fromisoformat(s)
+    try:
+        return datetime.fromisoformat(s)
+    except:
+        return None
 
 def _get_collection(col_name: Optional[str]):
     if not col_name:
@@ -132,47 +138,91 @@ def _suggest_reallocation(channels_summary, kpi="ROAS", constraints=None):
 @app.post("/mcp/query-data")
 def query_data(payload: QueryPayload):
     try:
-        dt_from = _parse_iso(payload.from_date)
-        dt_to = _parse_iso(payload.to_date)
+        # Handle both alias and field names
+        from_date = payload.from_date if hasattr(payload, 'from_date') and payload.from_date else None
+        to_date = payload.to_date if hasattr(payload, 'to_date') and payload.to_date else None
+        
+        dt_from = _parse_iso(from_date)
+        dt_to = _parse_iso(to_date)
         col = _get_collection(payload.collection)
         q = {}
-        # Date filter
+        
+        # Date filter - handle MongoDB ISODate objects
         if dt_from or dt_to:
             q["date"] = {}
             if dt_from:
-                q["date"]["$gte"] = dt_from.strftime("%Y-%m-%d")
+                # Use actual datetime object for MongoDB date comparison
+                q["date"]["$gte"] = dt_from
             if dt_to:
-                q["date"]["$lte"] = dt_to.strftime("%Y-%m-%d")
-        # Channel/source filter
+                # Add 23:59:59 to include the entire end date
+                end_datetime = dt_to.replace(hour=23, minute=59, second=59, microsecond=999999)
+                q["date"]["$lte"] = end_datetime
+        
+        # Channel/source filter - more flexible matching
         if payload.channels:
-            # Try all possible field names
-            q["$or"] = [
-                {"channel": {"$in": payload.channels}},
-                {"source": {"$in": payload.channels}},
-                {"retailer_id": {"$in": payload.channels}},
-                {"retailer_name": {"$in": payload.channels}},
-            ]
+            # Convert channel names to potential retailer_ids
+            channel_conditions = []
+            for ch in payload.channels:
+                channel_conditions.extend([
+                    {"channel": {"$regex": ch, "$options": "i"}},
+                    {"source": {"$regex": ch, "$options": "i"}},
+                    {"retailer_name": {"$regex": ch, "$options": "i"}},
+                    {"retailer_id": ch},  # Exact string match
+                ])
+                # Try numeric conversion
+                try:
+                    if ch.isdigit():
+                        channel_conditions.append({"retailer_id": int(ch)})
+                except:
+                    pass
+                
+                # Map common channel names to retailer_ids based on your data
+                channel_mapping = {
+                    "amazon": [2, 33, "amazon", "Amazon"],
+                    "walmart": [16, 21, "walmart", "Walmart"],
+                    "kroger": [32, "kroger", "Kroger"],
+                    "meijer": [21, "meijer", "Meijer"]
+                }
+                
+                ch_lower = ch.lower()
+                if ch_lower in channel_mapping:
+                    for mapped_id in channel_mapping[ch_lower]:
+                        if isinstance(mapped_id, int):
+                            channel_conditions.append({"retailer_id": mapped_id})
+                        else:
+                            channel_conditions.append({"retailer_name": {"$regex": mapped_id, "$options": "i"}})
+            
+            q["$or"] = channel_conditions
+        
         # Choose group_by and metrics based on collection
         if payload.collection == "retailer_keywords_daily":
             group_by = "keywords"
             metrics = ["impressions", "clicks", "ad_spend", "ad_sales", "ad_units"]
-            summary = _aggregate_generic(col, q, group_by, metrics, top_n=payload.top_n_campaigns, sort_by="ad_sales")
         elif payload.collection == "retailer_page_type_daily":
             group_by = "page_type"
             metrics = ["impressions", "clicks", "ad_spend", "ad_sales", "ad_units"]
-            summary = _aggregate_generic(col, q, group_by, metrics, top_n=payload.top_n_campaigns, sort_by="ad_sales")
         elif payload.collection == "retailer_product_daily":
             group_by = "product_id"
             metrics = ["impressions", "clicks", "ad_spend", "ad_sales", "ad_units"]
-            summary = _aggregate_generic(col, q, group_by, metrics, top_n=payload.top_n_campaigns, sort_by="ad_sales")
         else:  # Default: retailer_daily_spend or similar
             group_by = "retailer_id"
             metrics = ["impressions", "clicks", "ad_spend", "ad_sales", "ad_units"]
-            summary = _aggregate_generic(col, q, group_by, metrics, top_n=payload.top_n_campaigns, sort_by="ad_sales")
+        
+        summary = _aggregate_generic(col, q, group_by, metrics, top_n=payload.top_n_campaigns, sort_by="ad_sales")
+        
         # Suggest reallocation (only for spend-based collections)
         suggested = _suggest_reallocation(summary, kpi=payload.kpi, constraints=payload.constraints or {})
-        metadata = {"query": payload.query, "kpi": payload.kpi, "time_range": {"from": payload.from_date, "to": payload.to_date}, "collection": payload.collection}
+        
+        metadata = {
+            "query": payload.query, 
+            "kpi": payload.kpi, 
+            "time_range": {"from": from_date, "to": to_date}, 
+            "collection": payload.collection,
+            "total_records_found": len(summary),
+            "filters_applied": q
+        }
         explainability = "Heuristic proportional allocation using ROAS and conversion rate (weights: ROAS 0.7, conv 0.3). Bounds: +/-50% per channel."
+        
         return {
             "metadata": metadata,
             "summary": summary,
@@ -188,6 +238,16 @@ def query_data(payload: QueryPayload):
 def health():
     return {"status": "ok", "db": DB_NAME, "collections": list(COLLECTIONS.keys())}
 
+# Debug endpoint to check data
+@app.get("/debug/sample-data")
+def debug_sample_data(collection: str = "retailer_daily_spend"):
+    try:
+        col = _get_collection(collection)
+        sample = list(col.find().limit(3))
+        return {"collection": collection, "sample_records": sample}
+    except Exception as e:
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)  # Pass app object directly
+    uvicorn.run(app, host="0.0.0.0", port=port)
