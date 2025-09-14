@@ -189,4 +189,5 @@ def health():
     return {"status": "ok", "db": DB_NAME, "collections": list(COLLECTIONS.keys())}
 
 if __name__ == "__main__":
-    uvicorn.run("mcp_server:app", host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)  # Pass app object directly
